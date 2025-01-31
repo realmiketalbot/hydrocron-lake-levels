@@ -1,0 +1,151 @@
+---
+title: "Prior Lake Database Download"
+author: "Mike Talbot"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+The Prior Lake Database is a global inventory of lakes and reservoirs, providing polygons and associated metadata to support the SWOT mission. It is available as a WFS layer:
+
+https://hydroweb.next.theia-land.fr/geoserver/REF_DATA/ows?SERVICE=WFS&VERSION=1.1.0&REQUEST=GetCapabilities
+
+There is also a viewer here:
+
+https://apps.usgs.gov/wisp?lat=38.930381&lon=-105.880068&zoom=6.55&basemap=%22Light%22&useDevStyles=false&activeLayers=%5B%7B%22id%22%3A%22sword%22%2C%22value%22%3A%22width%22%7D%2C%7B%22id%22%3A%22lakes%22%7D%5D
+
+```{r setup, eval=FALSE, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+library(sf)
+library(dplyr)
+library(purrr)
+library(fs)
+library(readr)
+library(lubridate)
+
+# Set GDAL to ignore errors and increase timeout
+Sys.setenv(CPL_CURL_IGNORE_ERROR = "YES")
+Sys.setenv(GDAL_HTTP_TIMEOUT = "300")
+```
+
+```{r download_pld, eval=FALSE, include=TRUE}
+# Define the WFS base URL
+wfs_base_url <- "https://hydroweb.next.theia-land.fr/geoserver/REF_DATA/ows?SERVICE=WFS&VERSION=1.1.0&REQUEST=GetFeature&TYPENAME=REF_DATA:swot_prior_lake_db&outputFormat=application/json&BBOX="
+
+# Create a log file
+log_file <- "data/pld_download_log.txt"
+write_lines("SWOT PLD Download Log\n", log_file, append = FALSE)  # Overwrite existing log
+
+# Generate 5° x 5° grid
+lon_steps <- seq(-180, 175, by = 5)  # Longitudes: -180 to 180 (step = 5°)
+lat_steps <- seq(-90, 85, by = 5)    # Latitudes: -90 to 90 (step = 5°)
+
+# Create a list of bounding boxes
+bbox_list <- expand.grid(lon_min = lon_steps, lat_min = lat_steps) %>%
+  mutate(lon_max = lon_min + 5, lat_max = lat_min + 5) %>%
+  split(1:nrow(.))  # Split into individual bounding boxes
+
+# Function to download a single 5° x 5° block
+download_block <- function(bbox, index) {
+  # Construct the BBOX query string (SWAPPING lat/lon order)
+  bbox_str <- paste(bbox$lat_min, bbox$lon_min, bbox$lat_max, bbox$lon_max, sep = ",")  # LAT first!
+  wfs_url <- paste0(wfs_base_url, bbox_str)
+
+  # Define filename for the block
+  file_name <- sprintf("data/pld_block_%04d.rds", index)
+  
+  if (file.exists(file_name)) {
+    log_message <- paste(Sys.time(), "📂 File already exists:", file_name, "\n")
+    write_lines(log_message, log_file, append = TRUE)
+    return(NULL)
+  } else {
+    # Try downloading the block
+    tryCatch({
+      # Read WFS data into sf object
+      pld_sf <- st_read(wfs_url, quiet = TRUE)
+  
+      # Skip empty downloads
+      if (nrow(pld_sf) == 0) {
+        log_message <- paste(Sys.time(), "⚠️ Empty response:", file_name, "\n")
+        write_lines(log_message, log_file, append = TRUE)
+        return(NULL)
+      }
+  
+      # Save as RDS
+      saveRDS(pld_sf, file_name)
+  
+      log_message <- paste(Sys.time(), "✅ Downloaded and saved:", file_name, "\n")
+      write_lines(log_message, log_file, append = TRUE)
+  
+      return(file_name)
+    }, error = function(e) {
+      log_message <- paste(Sys.time(), "⚠️ Failed:", file_name, "Error:", e$message, "\n")
+      write_lines(log_message, log_file, append = TRUE)
+      return(NULL)
+    })
+  }
+}
+
+# Download all blocks
+downloaded_files <- map2(bbox_list, seq_along(bbox_list), download_block)
+
+# Remove NULLs (failed downloads, empty responses)
+downloaded_files <- downloaded_files[!sapply(downloaded_files, is.null)]
+
+# Function to read RDS and fix column types before merging
+read_and_fix_columns <- function(file) {
+  tryCatch({
+    data <- readRDS(file)
+
+    # Convert target columns to date/time
+    date_columns <- c('p_date_t0')
+    for (col in date_columns) {
+      if (is.character(data[[col]])) {
+        data[[col]] <- ymd_hms(data[[col]], quiet = TRUE)
+      }
+    }
+    
+    # Convert target columns to numeric
+    num_columns <- c('p_ref_wse', 'p_ref_area', 'p_storage', 'p_ds_t0')
+    for (col in num_columns) {
+      if (!is.numeric(data[[col]])) {
+        data[[col]] <- as.numeric(data[[col]])
+      }
+    }
+    
+    # Convert all other non-geometry columns to string
+    str_columns <- names(data)[!(names(data) %in% date_columns | names(data) %in% num_columns) & names(data) != "geometry"]
+    for (col in str_columns) {
+      if (!is.character(data[[col]])) {
+        data[[col]] <- as.character(data[[col]])
+      }
+    }
+
+    # Detect inconsistent column types
+    return(data)
+  }, error = function(e) {
+    log_message <- paste(Sys.time(), "⚠️ Failed to read:", file, "Error:", e$message, "\n")
+    write_lines(log_message, log_file, append = TRUE)
+    return(NULL)
+  })
+}
+
+# Merge all blocks and save as FlatGeobuf
+if (length(downloaded_files) > 0) {
+  # Read all downloaded files and fix `_id` and datetime column types
+  all_blocks <- map(downloaded_files, read_and_fix_columns) %>%
+    compact() %>%  # Remove NULLs
+    bind_rows()
+
+  # Save as FlatGeobuf
+  st_write(all_blocks, "data/pld_merged.fgb", driver = "FlatGeobuf")
+
+  log_message <- paste(Sys.time(), "🚀 Successfully downloaded and saved SWOT PLD as FlatGeobuf!\n")
+  write_lines(log_message, log_file, append = TRUE)
+
+  print("🚀 Successfully downloaded and saved SWOT PLD as FlatGeobuf (swot_pld_merged.fgb)!")
+} else {
+  print("❌ No blocks were successfully downloaded.")
+}
+
+```
+
