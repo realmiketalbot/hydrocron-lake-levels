@@ -20,6 +20,7 @@ library(httr)
 library(jsonlite)
 ```
 
+\newpage
 # Download
 ```{r download_example_lake_data}
 # Define download directory and file name
@@ -28,7 +29,7 @@ out_dir <- "data"
 # Define an output file name
 out_file <- "example_data.csv"
 
-# Define the ID of the lake you want to query
+# Define the ID of the lake you want to query (7420101733 is Horsetooth Reservoir)
 lake_id <- "7420101733"
 
 # Define the start and end times of the time series of lake levels
@@ -67,9 +68,13 @@ data <- read_csv(file.path(out_dir, out_file), show_col_types = F)
 # View first six rows ("head") of data
 print(head(data))
 
-# Filter out "No Data" (really large or small) values
+# Filter out no_data values
 data <- data %>%
-  filter(wse > -1E10 & wse < 1E10)
+  filter(time_str != "no_data")
+
+# Convert `time_str` to a datetime object
+data <- data %>%
+  mutate(time_str = ymd_hms(time_str))
 
 # Plot data
 ggplot(data, aes(x = time_str, y = wse)) +
